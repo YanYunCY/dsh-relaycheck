@@ -1,0 +1,50 @@
+{
+  "name": "dsh-relaycheck",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: a relay_check tool that lets the agent verify an LLM API relay really serves the model it claims, using relaycheck.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "relaycheck",
+    "llm",
+    "relay"
+  ],
+  "license": "MIT",
+  "author": "YanYunCY",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YanYunCY/dsh-relaycheck.git"
+  },
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "relaycheck": "^0.2.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "^3.18.5"
+  }
+}
