@@ -53,6 +53,20 @@ test('missing key env fails with a model-readable error before any request', asy
   await assert.rejects(tool.execute({}, {}), /RELAY_KEY is not set/)
 })
 
+test('relay key never appears in errors, even when relaycheck echoes it', async () => {
+  const key = 'sk-secret-ABC123xyz'
+  let seenEnv
+  const tool = createTool(cfg(), { cli: 'x', env: { RELAY_KEY: key }, runCli: async (argv, opts) => {
+    seenEnv = opts.env
+    assert.ok(!argv.includes(key), 'key must not be on argv')
+    return { code: 2, stderr: `401 Unauthorized for Bearer ${key}\nretry with ${key}` }
+  } })
+  const err = await tool.execute({}, {}).then(() => assert.fail('should throw'), (e) => e)
+  assert.match(err.message, /relaycheck failed \(exit 2\)/)
+  assert.ok(!err.message.includes(key), err.message)
+  assert.equal(seenEnv.RELAY_KEY, key)
+})
+
 test('approval gate asks only for relay_check', async () => {
   const handlers = {}
   const ctx = { tools: { register: (t) => { handlers.tool = t } }, effect: (f) => f(), on: (e, f) => { handlers[e] = f } }
