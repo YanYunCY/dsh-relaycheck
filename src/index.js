@@ -13,6 +13,10 @@ export const inject = ['tools']
 export const TOOL_NAME = 'relay_check'
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
+const VERDICTS = ['consistent', 'inconsistent', 'inconclusive']
+// setTimeout clamps larger delays to 1 ms, which would kill the run at once.
+const MAX_TIMER_MS = 2 ** 31 - 1
+const has = (obj, key) => typeof key === 'string' && Object.hasOwn(obj, key)
 
 const Target = Schema.object({
   baseUrl: Schema.string().required().description('Relay base URL, e.g. https://relay.example.com'),
@@ -86,10 +90,10 @@ export function resolveTarget(config, args, session) {
   const ids = Object.keys(targets)
   if (ids.length === 0) throw new Error('relay_check has no configured targets. Ask the user to add one under targets in the dsh-relaycheck plugin config.')
   let id = args.target
-  if (id !== undefined && !(id in targets)) throw new Error(`unknown target "${id}". Configured targets: ${ids.join(', ')}`)
+  if (id !== undefined && !has(targets, id)) throw new Error(`unknown target "${id}". Configured targets: ${ids.join(', ')}`)
   if (id === undefined && session?.provider) id = ids.find((k) => targets[k].provider === session.provider)
   if (id === undefined) id = config.defaultTarget ?? (ids.length === 1 ? ids[0] : undefined)
-  if (id === undefined || !(id in targets)) throw new Error(`no target matches the current session; name one of: ${ids.join(', ')}`)
+  if (id === undefined || !has(targets, id)) throw new Error(`no target matches the current session; name one of: ${ids.join(', ')}`)
   const target = targets[id]
   const sameProvider = session?.provider !== undefined && target.provider === session.provider
   const model = args.model ?? target.model ?? (sameProvider ? session.model : undefined)
@@ -97,10 +101,33 @@ export function resolveTarget(config, args, session) {
   return { id, target, model }
 }
 
+/** The key variable name of a target; throws when it is not a valid env var name. */
+export function keyEnvOf(target) {
+  const keyEnv = target.keyEnv ?? 'RELAY_KEY'
+  if (typeof keyEnv !== 'string' || !ENV_NAME.test(keyEnv)) throw new Error(`keyEnv "${keyEnv}" is not an environment variable name`)
+  return keyEnv
+}
+
+/** The relay host for a target; throws a model-readable Error unless baseUrl is an http(s) URL. */
+export function hostOf(baseUrl) {
+  let url
+  try { url = new URL(baseUrl) } catch { throw new Error(`baseUrl "${baseUrl}" is not a valid URL`) }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error(`baseUrl "${url.origin === 'null' ? url.protocol : url.origin}" must use http or https`)
+  return url.host
+}
+
+/** Replace every occurrence of secret in every string of value (deep). */
+export function redactDeep(value, secret) {
+  if (!secret) return value
+  if (typeof value === 'string') return value.replaceAll(secret, '***')
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v, secret))
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v, secret)]))
+  return value
+}
+
 /** Build relaycheck argv. Pure, for tests. */
 export function buildArgv(cli, target, model, config, args, jsonPath) {
-  const keyEnv = target.keyEnv ?? 'RELAY_KEY'
-  if (!ENV_NAME.test(keyEnv)) throw new Error(`keyEnv "${keyEnv}" is not an environment variable name`)
+  const keyEnv = keyEnvOf(target)
   const argv = [cli, target.baseUrl, '--model', model, '--api', target.api ?? 'auto', '--key-env', keyEnv,
     '--samples', String(config.samples ?? 16), '--probes', args.probes ?? config.probes ?? 'identity,protocol,billing,context',
     '--lang', config.lang ?? 'en', '--json', jsonPath, '--quiet', '--no-color']
@@ -112,13 +139,25 @@ export function buildArgv(cli, target, model, config, args, jsonPath) {
   return argv
 }
 
-const pick = (l10n, lang) => (typeof l10n === 'string' ? l10n : l10n?.[lang] ?? l10n?.en ?? '')
+const pick = (l10n, lang) => {
+  if (typeof l10n === 'string') return l10n
+  const v = l10n?.[lang] ?? l10n?.en
+  return typeof v === 'string' ? v : ''
+}
+/** A finite number truncated to an integer, else the fallback. */
+const int = (v, fallback) => (typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : fallback)
 
 /** Reduce a relaycheck JSON report to the tool's canonical value. */
 export function summarize(report, meta, lang) {
-  const groups = (report.groups ?? []).map((g) => ({ id: String(g.id), status: String(g.status), summary: pick(g.summary, lang) }))
+  if (!report || typeof report !== 'object' || Array.isArray(report) || !VERDICTS.includes(report.verdict)) {
+    throw new Error(`relaycheck wrote a report without a valid verdict (exit ${meta.exitCode}); the relaycheck version may be incompatible`)
+  }
+  const groups = (Array.isArray(report.groups) ? report.groups : [])
+    .filter((g) => g && typeof g === 'object')
+    .map((g) => ({ id: String(g.id), status: String(g.status), summary: pick(g.summary, lang) }))
   const p = report.pValue
-  const u = report.usage ?? {}
+  const u = report.usage && typeof report.usage === 'object' ? report.usage : {}
+  const injected = int(report.injectedTokens, undefined)
   return {
     target: meta.id,
     host: meta.host,
@@ -128,15 +167,15 @@ export function summarize(report, meta, lang) {
     headline: pick(report.headline, lang),
     ...(typeof p === 'number' && Number.isFinite(p) ? { pValue: p } : {}),
     calibrated: report.calibrated === true,
-    ...(typeof report.injectedTokens === 'number' ? { injectedTokens: Math.trunc(report.injectedTokens) } : {}),
+    ...(injected !== undefined ? { injectedTokens: injected } : {}),
     exitCode: meta.exitCode,
     groups,
     usage: {
-      inputTokens: Math.trunc(u.inputTokens ?? 0),
-      outputTokens: Math.trunc(u.outputTokens ?? 0),
-      requests: Math.trunc(u.requests ?? 0),
+      inputTokens: int(u.inputTokens, 0),
+      outputTokens: int(u.outputTokens, 0),
+      requests: int(u.requests, 0),
     },
-    durationMs: Math.trunc(report.durationMs ?? meta.durationMs ?? 0),
+    durationMs: int(report.durationMs, int(meta.durationMs, 0)),
   }
 }
 
@@ -153,21 +192,26 @@ export function render(value) {
   return [{ type: 'text', text: lines.filter(Boolean).join('\n') }]
 }
 
-/** Run relaycheck as a child process; resolves with { code, stderr }. */
-export function runCli(argv, { signal, timeoutMs, env = process.env, execPath = process.execPath }) {
+/**
+ * Run relaycheck as a child process; resolves with { code, stderr, signal, timedOut }.
+ * `redact` is applied to stderr before it is truncated, so a cut can never leave half a secret behind.
+ */
+export function runCli(argv, { signal, timeoutMs, env = process.env, execPath = process.execPath, redact = (s) => s }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error('aborted'))
     const child = spawn(execPath, argv, { env, stdio: ['ignore', 'ignore', 'pipe'] })
     let stderr = ''
-    child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-4000) })
+    let timedOut = false
+    child.stderr.on('data', (d) => { stderr = redact(stderr + d).slice(-4000) })
     const kill = () => child.kill('SIGTERM')
-    const timer = setTimeout(kill, timeoutMs)
+    const timer = setTimeout(() => { timedOut = true; kill() }, Math.min(Math.max(1, timeoutMs), MAX_TIMER_MS))
     signal?.addEventListener('abort', kill, { once: true })
-    child.on('error', (e) => { clearTimeout(timer); reject(e) })
+    child.on('error', (e) => { clearTimeout(timer); signal?.removeEventListener('abort', kill); reject(e) })
     child.on('close', (code, sig) => {
       clearTimeout(timer)
       signal?.removeEventListener('abort', kill)
       if (signal?.aborted) return reject(signal.reason ?? new Error('aborted'))
-      resolve({ code: code ?? (sig ? 3 : 0), stderr, signal: sig })
+      resolve({ code: code ?? (sig ? 3 : 0), stderr, signal: sig, timedOut })
     })
   })
 }
@@ -205,22 +249,31 @@ export function createTool(config, deps = {}) {
     async execute(rawArgs, exec) {
       const args = rawArgs ?? {}
       const { id, target, model } = resolveTarget(config, args, sessionInfo(exec?.agent))
-      const keyEnv = target.keyEnv ?? 'RELAY_KEY'
+      const keyEnv = keyEnvOf(target)
+      const host = hostOf(target.baseUrl)
       const env = deps.env ?? process.env
-      if (!env[keyEnv]) throw new Error(`environment variable ${keyEnv} is not set for target "${id}"; the user must export it before starting dsh`)
+      const key = env[keyEnv]
+      if (typeof key !== 'string' || key === '') throw new Error(`environment variable ${keyEnv} is not set for target "${id}"; the user must export it before starting dsh`)
+      const signals = [exec?.signal, deps.signal].filter(Boolean)
+      const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0]
+      if (signal?.aborted) throw signal.reason ?? new Error('aborted')
+      const redact = (s) => s.replaceAll(key, '***')
       const dir = await mkdtemp(join(tmpdir(), 'dsh-relaycheck-'))
       const started = Date.now()
       try {
         const jsonPath = join(dir, 'report.json')
         const argv = buildArgv(cli, target, model, config, args, jsonPath)
         const run = deps.runCli ?? runCli
-        const { code, stderr } = await run(argv, { signal: exec?.signal, timeoutMs: (config.timeoutSeconds ?? 600) * 1000, env })
+        const timeoutSeconds = config.timeoutSeconds ?? 600
+        const { code, stderr = '', timedOut } = await run(argv, { signal, timeoutMs: timeoutSeconds * 1000, env, redact })
         let report
         try { report = JSON.parse(await readFile(jsonPath, 'utf8')) } catch {
-          const tail = stderr.trim().split('\n').slice(-3).join(' ').replaceAll(env[keyEnv], '***')
-          throw new Error(`relaycheck failed (exit ${code})${tail ? `: ${tail}` : ''}`)
+          const tail = redact(String(stderr).trim().split('\n').slice(-3).join(' '))
+          const why = timedOut ? `timed out after ${timeoutSeconds}s` : `failed (exit ${code})`
+          throw new Error(`relaycheck ${why}${tail ? `: ${tail}` : ''}`)
         }
-        return summarize(report, { id, host: new URL(target.baseUrl).host, model, api: target.api ?? 'auto', exitCode: code, durationMs: Date.now() - started }, config.lang ?? 'en')
+        const value = summarize(report, { id, host, model, api: target.api ?? 'auto', exitCode: code, durationMs: Date.now() - started }, config.lang ?? 'en')
+        return redactDeep(value, key)
       } finally {
         await rm(dir, { recursive: true, force: true })
       }
@@ -229,7 +282,10 @@ export function createTool(config, deps = {}) {
 }
 
 export function apply(ctx, config) {
-  const tool = createTool(config)
+  // Disposing the plugin (profile reload, dsh exit) aborts any run still in flight.
+  const lifetime = new AbortController()
+  ctx.effect(() => () => lifetime.abort(new Error('dsh-relaycheck was disposed')), 'relay_check in-flight runs')
+  const tool = createTool(config, { signal: lifetime.signal })
   ctx.tools.register(tool)
   if (config.requireApproval !== false) {
     ctx.on('tools/pre-execute', async (exec, next) => {

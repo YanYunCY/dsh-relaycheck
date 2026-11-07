@@ -50,6 +50,8 @@ export RELAY_KEY=sk-...
 dsh web
 ```
 
+Each `baseUrl` must be an `http://` or `https://` URL and each `keyEnv` a plain variable name (`[A-Za-z_][A-Za-z0-9_]*`); the tool checks both, and that the variable is set and non-empty, before it starts relaycheck, so a misconfigured target costs no tokens.
+
 When `provider` matches the provider of the current session, the agent can call `relay_check` with no arguments to test "the relay I'm using now", with the session's model.
 
 | Option | Default | Meaning |
@@ -61,7 +63,7 @@ When `provider` matches the provider of the current session, the agent can call 
 | `allowDeep` | `false` | let the agent request `--deep` |
 | `requireApproval` | `true` | approval prompt before every run |
 | `lang` | `en` | `en` or `zh` for the summaries |
-| `timeoutSeconds` | `600` | kill the run after this long |
+| `timeoutSeconds` | `600` | kill the run after this long (the tool then reports a timeout) |
 
 ## The tool
 
@@ -78,7 +80,17 @@ When `provider` matches the provider of the current session, the agent can call 
 }
 ```
 
-`pValue` and `injectedTokens` are left out when relaycheck reports none. The model sees a short text summary of the same facts. The key never appears in the result or in error messages.
+`pValue` and `injectedTokens` are left out when relaycheck reports none. The model sees a short text summary of the same facts.
+
+The key is passed to relaycheck by variable name only, never on the command line. relaycheck redacts it from its own output; the plugin additionally replaces any occurrence of the key's exact value with `***` in the result and in error messages, as a second line of defence.
+
+When a run fails, the tool returns an ordinary error the model can read instead of a result:
+
+- relaycheck exits without a report (unreachable relay, HTTP errors, non-JSON responses, bad arguments): `relaycheck failed (exit N): <last lines of relaycheck's stderr>`
+- the run hits `timeoutSeconds`: `relaycheck timed out after Ns`
+- the report has no valid `verdict` (for example an incompatible relaycheck version): the tool says so rather than returning a partial result
+
+Cancelling the tool call, or disposing the plugin (profile reload, dsh exit), stops a run in progress.
 
 ## Cost
 
@@ -88,8 +100,10 @@ A default run sends a few hundred short requests (24 probes × `samples`, plus p
 
 ```bash
 npm install
-npm test     # unit tests + end-to-end runs against relaycheck's local mock relays (honest and model-swapping); no real API or key
+npm test     # no real API, no real key, no network beyond 127.0.0.1
 ```
+
+The suite covers config validation, target resolution, argv building, malformed reports, key redaction, abort/timeout handling and plugin disposal inside a real cordis + dsh-tools context. End-to-end cases run relaycheck against its own local mock relays (honest, model-swapping, token-injecting) and against small local HTTP servers that refuse connections, hang, return non-JSON, or echo the key back.
 
 ## License
 
